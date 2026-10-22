@@ -1,1 +1,80 @@
-solution file here
+"""Checkpoint 1.1 — Ask a plain LLM, without retrieval or access to PDFs.
+
+Run: python Checkpoint1.1/CurrentRetriever1.py
+This baseline can invent paper details. Compare its answers with the actual papers.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "openai/gpt-5.4-mini"
+TEMPERATURE = 0.2  # Lower randomness; this does not guarantee factual accuracy.
+
+SYSTEM_PROMPT = (
+    "You are a helpful research assistant. Answer the user's question as "
+    "accurately as you can. When you reference a specific document, quote "
+    "from it directly. If you are not certain, say so rather than guessing."
+)
+
+def check_api_key() -> str:
+    load_dotenv(SCRIPT_DIR / ".env")
+    load_dotenv(SCRIPT_DIR.parent / ".env")
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Put your key in the project-root "
+            ".env or a .env next to this script, and rerun. API usage is paid."
+        )
+    return key
+
+
+def build_chain() -> Any:
+    """Baseline LLM chain — no retrieval. Same pattern as Lab 1.1."""
+    llm = ChatOpenAI(
+        model=LLM_MODEL,
+        temperature=TEMPERATURE,
+        api_key=check_api_key(),
+        base_url=OPENROUTER_BASE_URL,
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", "{question}"),
+    ])
+    return prompt | llm
+
+
+def ask(chain: Any, question: str) -> str:
+    resp = chain.invoke({"question": question})
+    return resp.content if hasattr(resp, "content") else str(resp)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    chain = build_chain()
+    print("No-retrieval baseline. Questions are sent to OpenRouter.")
+    print("Each question is independent. Type exit or quit to stop.")
+    try:
+        while True:
+            question = input("\nYou: ").strip()
+            if question.lower() in {"exit", "quit"}:
+                break
+            if question:
+                print(f"\nAssistant: {ask(chain, question)}")
+    except (EOFError, KeyboardInterrupt):
+        print("\nChat closed.")
+
+
+# Importing the module defines its functions; only direct execution starts chat.
+if __name__ == "__main__":
+    main()
