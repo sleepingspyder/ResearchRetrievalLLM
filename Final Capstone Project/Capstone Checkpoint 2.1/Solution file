@@ -1,1 +1,308 @@
-solution
+"""Checkpoint 2.1 — Fixed hybrid PDF retrieval.
+
+Run: python Checkpoint2.1/CurrentRetriever2.py
+Use --build-index on the first run. See the root README for setup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from pypdf import PdfReader
+from rank_bm25 import BM25Okapi
+
+# %%
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "openai/gpt-5.4-mini"
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+TEMPERATURE = 0.2
+TOP_K = 4                    # Final PDF pages sent to the LLM.
+CANDIDATE_POOL = 10          # Candidates taken from each retrieval method.
+WEIGHT_BM25 = 0.5
+WEIGHT_VECTOR = 0.5
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+# Share only the input PDFs. Each checkpoint keeps its own saved index.
+RESEARCH_PAPERS_DIR = PROJECT_DIR / "ResearchPapers"
+DATA_DIR = PROJECT_DIR / ".local_data" / SCRIPT_DIR.name
+CHROMA_DIR = DATA_DIR / "chroma_db"
+CHROMA_COLLECTION = "research_paper_pages"
+
+ANSWER_SYSTEM = (
+    "You are a helpful research-paper assistant. Answer using ONLY the provided "
+    "pages, and cite factual claims as [filename, page N]. If the pages do not "
+    "contain enough evidence, say so rather than guessing."
+)
+
+
+# %%
+def check_api_key() -> str:
+    load_dotenv(SCRIPT_DIR / ".env")
+    load_dotenv(PROJECT_DIR / ".env")
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Use the OpenRouter API key "
+            "put it in the project-root .env or next to this "
+            "script, and rerun."
+        )
+    return key
+
+
+def make_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=LLM_MODEL,
+        temperature=TEMPERATURE,
+        api_key=check_api_key(),
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def make_embeddings() -> OpenAIEmbeddings:
+    """Use the same embedding setup as the Module 2 vector-search lab."""
+    return OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        api_key=check_api_key(),
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def load_pdf_pages(pdf_dir: Path) -> list[Document]:
+    """Extract one searchable Document per non-empty PDF page."""
+    if not pdf_dir.is_dir():
+        raise FileNotFoundError(f"Research-paper folder not found: {pdf_dir}")
+
+    documents: list[Document] = []
+    pdf_paths = sorted(pdf_dir.glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in: {pdf_dir}")
+
+    for pdf_path in pdf_paths:
+        try:
+            reader = PdfReader(pdf_path)
+        except Exception as exc:
+            print(f"Warning: could not open {pdf_path.name}: {exc}")
+            continue
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                text = (page.extract_text() or "").strip()
+            except Exception as exc:
+                print(f"Warning: skipped {pdf_path.name}, page {page_number}: {exc}")
+                continue
+            if not text:
+                continue
+
+            page_id = f"{pdf_path.name}:page-{page_number}"
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "id": page_id,
+                        "source": pdf_path.name,
+                        "page": page_number,
+                    },
+                )
+            )
+
+    if not documents:
+        raise RuntimeError(f"No readable text was extracted from PDFs in: {pdf_dir}")
+    print(f"Loaded {len(documents)} pages from {len(pdf_paths)} PDFs.")
+    return documents
+
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "but", "or", "for", "in", "on", "at", "to",
+    "of", "by", "with", "from", "about", "is", "are", "was", "were", "be",
+    "been", "have", "has", "had", "do", "does", "did", "who", "what", "how",
+    "i", "we", "you", "he", "she", "it", "they", "this", "that", "these",
+    "those", "as", "if", "not", "no",
+}
+
+
+def tokenize(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in _STOPWORDS
+    ]
+
+
+def validate_index(vector_db, documents: list[Document]) -> None:
+    """Do not silently search old content after the local PDFs change."""
+    stored = vector_db.get(include=["documents"])
+    indexed_pages = dict(zip(stored["ids"], stored["documents"]))
+    current_pages = {str(doc.metadata["id"]): doc.page_content for doc in documents}
+    if indexed_pages != current_pages:
+        raise RuntimeError(
+            "The local Chroma index does not match these PDF pages. "
+            "Keep a backup of chroma_db, move it aside, then run with --build-index."
+        )
+
+
+def build_or_load_vector_db(documents: list[Document], allow_build: bool = False) -> Chroma:
+    """Reuse local embeddings; creating a new index requires an explicit flag."""
+    if (CHROMA_DIR / "chroma.sqlite3").is_file():
+        print(f"Loading existing vector database from {CHROMA_DIR}", flush=True)
+        vector_db = Chroma(
+            collection_name=CHROMA_COLLECTION,
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=make_embeddings(),
+        )
+        validate_index(vector_db, documents)
+        return vector_db
+
+    if not allow_build:
+        raise FileNotFoundError(
+            "No local Chroma index exists. Use --build-index to embed the PDF "
+            "pages through OpenRouter (paid API usage)."
+        )
+    if CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir()):
+        raise RuntimeError("chroma_db is not empty but has no SQLite index; inspect it first.")
+
+    CHROMA_DIR.parent.mkdir(parents=True, exist_ok=True)
+    print("Building a new vector database through OpenRouter...", flush=True)
+    return Chroma.from_documents(
+        documents=documents,
+        embedding=make_embeddings(),
+        ids=[str(doc.metadata["id"]) for doc in documents],
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=str(CHROMA_DIR),
+    )
+
+
+def load_research_data(build_index: bool = False):
+    """Early stages re-extract locally; only a missing index needs new embeddings."""
+    if not (CHROMA_DIR / "chroma.sqlite3").is_file() and not build_index:
+        raise FileNotFoundError("No saved index. Run with --build-index to embed your PDFs.")
+    check_api_key()
+    documents = load_pdf_pages(RESEARCH_PAPERS_DIR)
+    return documents, build_or_load_vector_db(documents, allow_build=build_index)
+
+
+def normalize(scores: list[float], invert: bool = False) -> list[float]:
+    """Scale scores to 0-1; invert distances because smaller is more similar."""
+    if not scores:
+        return []
+    low, high = min(scores), max(scores)
+    if low == high:
+        return [0.5] * len(scores)
+    normalized = [(score - low) / (high - low) for score in scores]
+    return [1.0 - score for score in normalized] if invert else normalized
+
+
+class HybridRetriever:
+    """Combine BM25 keyword matches with Chroma semantic matches."""
+
+    def __init__(self, documents: list[Document], vector_db: Chroma):
+        self._documents = documents
+        self._vector_db = vector_db
+        self._bm25 = BM25Okapi([tokenize(doc.page_content) for doc in documents])
+
+    def _bm25_top_k(self, query: str, k: int) -> list[tuple[Document, float]]:
+        scores = self._bm25.get_scores(tokenize(query))
+        indexes = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        return [
+            (self._documents[i], float(scores[i]))
+            for i in indexes[:k]
+            if scores[i] > 0
+        ]
+
+    def _vector_top_k(self, query: str, k: int) -> list[tuple[Document, float]]:
+        return self._vector_db.similarity_search_with_score(query, k=k)
+
+    def retrieve(self, query: str, k: int = TOP_K) -> list[tuple[Document, float]]:
+        bm25_results = self._bm25_top_k(query, CANDIDATE_POOL)
+        vector_results = self._vector_top_k(query, CANDIDATE_POOL)
+
+        documents_by_id: dict[str, Document] = {}
+        bm25_scores: dict[str, float] = {}
+        vector_scores: dict[str, float] = {}
+
+        bm25_normalized = normalize([score for _, score in bm25_results])
+        for (document, _), score in zip(bm25_results, bm25_normalized):
+            page_id = str(document.metadata["id"])
+            documents_by_id[page_id] = document
+            bm25_scores[page_id] = score
+
+        # Chroma returns distance, where a lower value means a closer match.
+        vector_normalized = normalize(
+            [distance for _, distance in vector_results],
+            invert=True,
+        )
+        for (document, _), score in zip(vector_results, vector_normalized):
+            page_id = str(document.metadata["id"])
+            documents_by_id[page_id] = document
+            vector_scores[page_id] = score
+
+        combined = [
+            (
+                document,
+                WEIGHT_BM25 * bm25_scores.get(page_id, 0.0)
+                + WEIGHT_VECTOR * vector_scores.get(page_id, 0.0),
+            )
+            for page_id, document in documents_by_id.items()
+        ]
+        combined.sort(key=lambda item: item[1], reverse=True)
+        return combined[:k]
+
+
+def source_label(document: Document) -> str:
+    return f"{document.metadata['source']}, page {document.metadata['page']}"
+
+
+def answer(llm: ChatOpenAI, query: str, hits: list[tuple[Document, float]]) -> str:
+    context = "\n\n---\n\n".join(
+        f"[{source_label(document)}]\n{document.page_content}"
+        for document, _ in hits
+    )
+    messages = [
+        SystemMessage(content=ANSWER_SYSTEM),
+        HumanMessage(content=f"Documents:\n{context}\n\nQuestion: {query}"),
+    ]
+    return llm.invoke(messages).content
+
+
+def run_chat(retriever, llm) -> None:
+    """Search and answer each question independently; no evaluation judge."""
+    print("\nAsk about your papers. Type exit or quit to stop.")
+    print("Questions and retrieved text are sent to OpenRouter.")
+    print("Previous turns are not sent to the model.")
+    try:
+        while True:
+            question = input("\nYou: ").strip()
+            if question.lower() in {"exit", "quit"}:
+                break
+            if not question:
+                continue
+            hits = retriever.retrieve(question, TOP_K)
+            for document, score in hits:
+                print(f"  [{source_label(document)}] score={score:.3f}")
+            result = answer(llm, question, hits) if hits else "No supporting pages were retrieved."
+            print(f"\nAssistant: {result}")
+    except (EOFError, KeyboardInterrupt):
+        print("\nChat closed.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-index", action="store_true",
+                        help="Allow creating a missing index; sends PDF text to OpenRouter.")
+    args = parser.parse_args()
+    documents, vector_db = load_research_data(args.build_index)
+    retriever = HybridRetriever(documents, vector_db)
+    llm = make_llm()
+    run_chat(retriever, llm)
+
+
+if __name__ == "__main__":
+    main()
