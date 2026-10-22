@@ -1,1 +1,584 @@
+"""Checkpoint 3.1 — Hybrid retrieval with a built-in five-question evaluation.
 
+Run: python Checkpoint3.1/CurrentRetriever3.py
+Use --build-index on the first run. See the root README for setup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from pypdf import PdfReader
+from rank_bm25 import BM25Okapi
+
+# %%
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "openai/gpt-5.4-mini"
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+TEMPERATURE = 0.2
+TOP_K = 5                    # Final PDF pages sent to the LLM.
+CANDIDATE_POOL = 10          # Candidates taken from each retrieval method.
+WEIGHT_BM25 = 0.55
+WEIGHT_VECTOR = 0.45
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+# Share only the input PDFs. Each checkpoint keeps its own saved index.
+RESEARCH_PAPERS_DIR = PROJECT_DIR / "ResearchPapers"
+DATA_DIR = PROJECT_DIR / ".local_data" / SCRIPT_DIR.name
+CHROMA_DIR = DATA_DIR / "chroma_db"
+LOG_PATH = DATA_DIR / "evaluation.log"
+CHROMA_COLLECTION = "research_paper_pages"
+
+SCENARIO = "Research Paper Navigator"
+
+ANSWER_SYSTEM = (
+    "You are a helpful research-paper assistant. Answer using ONLY the provided "
+    "pages, and cite factual claims as [filename, page N]. If the pages do not "
+    "contain enough evidence, say so rather than guessing."
+)
+JUDGE_SYSTEM = (
+    "You are a strict evaluator. You are given an ANSWER and GRADING NOTES describing "
+    "what a correct answer must contain. Reply with exactly one word: 'pass' if the "
+    "answer satisfies the grading notes, or 'fail' if it does not."
+)
+
+
+# %%
+def check_api_key() -> str:
+    load_dotenv(SCRIPT_DIR / ".env")
+    load_dotenv(PROJECT_DIR / ".env")
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Use the OpenRouter API key "
+            "put it in the project-root .env or next to this "
+            "script, and rerun."
+        )
+    return key
+
+
+def make_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=LLM_MODEL,
+        temperature=TEMPERATURE,
+        api_key=check_api_key(),
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def make_embeddings() -> OpenAIEmbeddings:
+    """Use the same embedding setup as the Module 2 vector-search lab."""
+    return OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        api_key=check_api_key(),
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def log(label: str, text: str) -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{ts}] {label}\n{text}\n{'-' * 72}\n")
+
+
+def is_reasonable_title(title: str) -> bool:
+    """Reject first-page text blocks that clearly include more than a title."""
+    lowered = title.lower()
+    unwanted_text = (
+        " abstract.",
+        " abstract ",
+        " 1 introduction",
+        "editorial board",
+        "commenced publication",
+        "we thank the reviewers",
+    )
+    return 2 <= len(title.split()) and len(title) <= 220 and not any(
+        marker in lowered for marker in unwanted_text
+    )
+
+
+def extract_title(first_page, first_page_text: str, fallback: str) -> str:
+    """Read the title-sized text near the top of a paper's first page."""
+    fragments: list[tuple[float, float, str]] = []
+
+    def collect_text(text, _cm, tm, _font, font_size) -> None:
+        cleaned = text.strip()
+        if cleaned:
+            fragments.append((float(font_size), float(tm[5]), text))
+
+    try:
+        first_page.extract_text(visitor_text=collect_text)
+        page_height = float(first_page.mediabox.height)
+        top_fragments = [
+            item
+            for item in fragments
+            if item[1] > page_height * 0.55
+            and not item[2].strip().lower().startswith(
+                ("published as", "findings of", "proceedings of", "arxiv:")
+            )
+        ]
+        largest_font = max(size for size, _, _ in top_fragments)
+        title_lines = sorted(
+            {
+                round(y, 1)
+                for size, y, _ in top_fragments
+                if size >= largest_font - 0.2
+            },
+            reverse=True,
+        )
+
+        rendered_lines: list[str] = []
+        for title_y in title_lines:
+            line_fragments = [
+                (size, text)
+                for size, y, text in top_fragments
+                if abs(y - title_y) < 1.0 and size >= largest_font - 4.0
+            ]
+            line = ""
+            previous_size: float | None = None
+            for size, text in line_fragments:
+                piece = text.strip()
+                joins_small_cap = (
+                    previous_size is not None
+                    and previous_size >= largest_font - 0.2
+                    and size < largest_font - 0.2
+                    and line
+                    and line[-1].isalpha()
+                    and piece[0].isalpha()
+                )
+                line += piece if joins_small_cap else f" {piece}"
+                previous_size = size
+            # Remove a line-wrap hyphen before joining the next title line.
+            rendered_lines.append(re.sub(r"\s+-\s*$", "-", line.strip()))
+
+        title = ""
+        for line in rendered_lines:
+            if title.endswith("-"):
+                title = title[:-1] + line
+            else:
+                title = f"{title} {line}".strip()
+        title = re.sub(r"\s+([:;?,])", r"\1", title)
+        title = re.sub(r"\s*-\s*", "-", title)
+        if is_reasonable_title(title):
+            return title
+    except (TypeError, ValueError):
+        pass
+
+    # Plain-text fallback for PDFs whose font information cannot be read.
+    for line in first_page_text.splitlines()[:20]:
+        candidate = " ".join(line.split())
+        lower = candidate.lower()
+        if not candidate or lower.startswith(
+            ("published as", "findings of", "proceedings of", "arxiv:")
+        ):
+            continue
+        if lower == "abstract" or "@" in candidate:
+            break
+        return candidate if is_reasonable_title(candidate) else fallback
+    return fallback
+
+
+def load_pdf_pages(pdf_dir: Path) -> list[Document]:
+    """Extract one searchable Document per non-empty PDF page."""
+    if not pdf_dir.is_dir():
+        raise FileNotFoundError(f"Research-paper folder not found: {pdf_dir}")
+
+    documents: list[Document] = []
+    pdf_paths = sorted(pdf_dir.glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in: {pdf_dir}")
+
+    for pdf_path in pdf_paths:
+        try:
+            reader = PdfReader(pdf_path)
+        except Exception as exc:
+            print(f"Warning: could not open {pdf_path.name}: {exc}")
+            continue
+        if not reader.pages:
+            print(f"Warning: skipped empty PDF {pdf_path.name}")
+            continue
+
+        try:
+            first_page_text = (reader.pages[0].extract_text() or "").strip()
+        except Exception as exc:
+            print(f"Warning: could not read the title from {pdf_path.name}: {exc}")
+            first_page_text = ""
+        embedded_title = str((reader.metadata or {}).get("/Title") or "").strip()
+        if embedded_title.lower() in {"title", "untitled"}:
+            embedded_title = ""
+        fallback_title = (
+            embedded_title if is_reasonable_title(embedded_title) else pdf_path.stem
+        )
+        title = extract_title(reader.pages[0], first_page_text, fallback_title)
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                text = first_page_text if page_number == 1 else (page.extract_text() or "").strip()
+            except Exception as exc:
+                print(f"Warning: skipped {pdf_path.name}, page {page_number}: {exc}")
+                continue
+            if not text:
+                continue
+
+            page_id = f"{pdf_path.name}:page-{page_number}"
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "id": page_id,
+                        "source": pdf_path.name,
+                        "title": title,
+                        "page": page_number,
+                    },
+                )
+            )
+
+    if not documents:
+        raise RuntimeError(f"No readable text was extracted from PDFs in: {pdf_dir}")
+    print(f"Loaded {len(documents)} pages from {len(pdf_paths)} PDFs.")
+    return documents
+
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "but", "or", "for", "in", "on", "at", "to",
+    "of", "by", "with", "from", "about", "is", "are", "was", "were", "be",
+    "been", "have", "has", "had", "do", "does", "did", "who", "what", "how",
+    "i", "we", "you", "he", "she", "it", "they", "this", "that", "these",
+    "those", "as", "if", "not", "no",
+}
+
+
+def tokenize(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in _STOPWORDS
+    ]
+
+
+def validate_index(vector_db, documents: list[Document]) -> None:
+    """Do not silently search old content after the local PDFs change."""
+    stored = vector_db.get(include=["documents"])
+    indexed_pages = dict(zip(stored["ids"], stored["documents"]))
+    current_pages = {str(doc.metadata["id"]): doc.page_content for doc in documents}
+    if indexed_pages != current_pages:
+        raise RuntimeError(
+            "The local Chroma index does not match these PDF pages. "
+            "Keep a backup of chroma_db, move it aside, then run with --build-index."
+        )
+
+
+def build_or_load_vector_db(documents: list[Document], allow_build: bool = False) -> Chroma:
+    """Reuse local embeddings; creating a new index requires an explicit flag."""
+    if (CHROMA_DIR / "chroma.sqlite3").is_file():
+        print(f"Loading existing vector database from {CHROMA_DIR}", flush=True)
+        vector_db = Chroma(
+            collection_name=CHROMA_COLLECTION,
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=make_embeddings(),
+        )
+        validate_index(vector_db, documents)
+        return vector_db
+
+    if not allow_build:
+        raise FileNotFoundError(
+            "No local Chroma index exists. Use --build-index to embed the PDF "
+            "pages through OpenRouter (paid API usage)."
+        )
+    if CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir()):
+        raise RuntimeError("chroma_db is not empty but has no SQLite index; inspect it first.")
+
+    CHROMA_DIR.parent.mkdir(parents=True, exist_ok=True)
+    print("Building a new vector database through OpenRouter...", flush=True)
+    return Chroma.from_documents(
+        documents=documents,
+        embedding=make_embeddings(),
+        ids=[str(doc.metadata["id"]) for doc in documents],
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=str(CHROMA_DIR),
+    )
+
+
+def load_research_data(build_index: bool = False):
+    """Early stages re-extract locally; only a missing index needs new embeddings."""
+    if not (CHROMA_DIR / "chroma.sqlite3").is_file() and not build_index:
+        raise FileNotFoundError("No saved index. Run with --build-index to embed your PDFs.")
+    check_api_key()
+    documents = load_pdf_pages(RESEARCH_PAPERS_DIR)
+    return documents, build_or_load_vector_db(documents, allow_build=build_index)
+
+
+def normalize(scores: list[float], invert: bool = False) -> list[float]:
+    """Scale scores to 0-1; invert distances because smaller is more similar."""
+    if not scores:
+        return []
+    low, high = min(scores), max(scores)
+    if low == high:
+        return [0.5] * len(scores)
+    normalized = [(score - low) / (high - low) for score in scores]
+    return [1.0 - score for score in normalized] if invert else normalized
+
+
+class HybridRetriever:
+    """Combine BM25 keyword matches with Chroma semantic matches."""
+
+    def __init__(self, documents: list[Document], vector_db: Chroma):
+        self._documents = documents
+        self._documents_by_id = {
+            str(doc.metadata["id"]): doc for doc in documents
+        }
+        self._vector_db = vector_db
+        self._bm25 = BM25Okapi([tokenize(doc.page_content) for doc in documents])
+
+    def _bm25_top_k(self, query: str, k: int) -> list[tuple[Document, float]]:
+        scores = self._bm25.get_scores(tokenize(query))
+        indexes = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        return [
+            (self._documents[i], float(scores[i]))
+            for i in indexes[:k]
+            if scores[i] > 0
+        ]
+
+    def _vector_top_k(self, query: str, k: int) -> list[tuple[Document, float]]:
+        results = self._vector_db.similarity_search_with_score(query, k=k)
+        # Enrich pages from an older Chroma index with the newly extracted title.
+        return [
+            (self._documents_by_id.get(str(doc.metadata.get("id")), doc), score)
+            for doc, score in results
+        ]
+
+    def retrieve(self, query: str, k: int = TOP_K) -> list[tuple[Document, float]]:
+        bm25_results = self._bm25_top_k(query, CANDIDATE_POOL)
+        vector_results = self._vector_top_k(query, CANDIDATE_POOL)
+
+        documents_by_id: dict[str, Document] = {}
+        bm25_scores: dict[str, float] = {}
+        vector_scores: dict[str, float] = {}
+
+        bm25_normalized = normalize([score for _, score in bm25_results])
+        for (document, _), score in zip(bm25_results, bm25_normalized):
+            page_id = str(document.metadata["id"])
+            documents_by_id[page_id] = document
+            bm25_scores[page_id] = score
+
+        # Chroma returns distance, where a lower value means a closer match.
+        vector_normalized = normalize(
+            [distance for _, distance in vector_results],
+            invert=True,
+        )
+        for (document, _), score in zip(vector_results, vector_normalized):
+            page_id = str(document.metadata["id"])
+            documents_by_id[page_id] = document
+            vector_scores[page_id] = score
+
+        combined = [
+            (
+                document,
+                WEIGHT_BM25 * bm25_scores.get(page_id, 0.0)
+                + WEIGHT_VECTOR * vector_scores.get(page_id, 0.0),
+            )
+            for page_id, document in documents_by_id.items()
+        ]
+        combined.sort(key=lambda item: item[1], reverse=True)
+        return combined[:k]
+
+
+def source_label(document: Document) -> str:
+    title = document.metadata.get("title") or Path(document.metadata["source"]).stem
+    return (
+        f"{title} ({document.metadata['source']}), "
+        f"page {document.metadata['page']}"
+    )
+
+
+def answer(llm: ChatOpenAI, query: str, hits: list[tuple[Document, float]]) -> str:
+    context = "\n\n---\n\n".join(
+        f"[{source_label(document)}]\n{document.page_content}"
+        for document, _ in hits
+    )
+    messages = [
+        SystemMessage(content=ANSWER_SYSTEM),
+        HumanMessage(content=f"Documents:\n{context}\n\nQuestion: {query}"),
+    ]
+    return llm.invoke(messages).content
+
+
+def judge(llm: ChatOpenAI, answer_text: str, grading_notes: str) -> str:
+    messages = [
+        SystemMessage(content=JUDGE_SYSTEM),
+        HumanMessage(
+            content=(
+                f"ANSWER:\n{answer_text}\n\nGRADING NOTES:\n{grading_notes}"
+                "\n\nVerdict (pass/fail):"
+            )
+        ),
+    ]
+    verdict = llm.invoke(messages).content.strip().lower()
+    return "pass" if verdict == "pass" else "fail"
+
+
+def my_eval_set() -> list[dict]:
+    """Return research-paper questions and the facts required to pass."""
+    return [
+        {
+            "question": (
+                "Which datasets were used to evaluate the network in 'Enhance Sketch "
+                "Recognition's Explainability via Semantic Component-Level Parsing,' "
+                "and what did the experiments demonstrate?"
+            ),
+            "grading_notes": (
+                "Must identify SPG and SketchIME and state that the experiments demonstrated "
+                "the memory module's flexibility and the recognition network's explainability."
+            ),
+        },
+        {
+            "question": (
+                "How does VLMATERIAL generate an editable procedural material from an image, "
+                "and how was its training dataset expanded?"
+            ),
+            "grading_notes": (
+                "Must explain that VLMATERIAL generates Python programs that produce editable "
+                "material graphs and that program-level plus node-parameter augmentation grew "
+                "the dataset from about 1.6K to about 550K examples."
+            ),
+        },
+        {
+            "question": (
+                "Compare the findings of 'The Counterfeit Conundrum' and 'Is Self-Repair a "
+                "Silver Bullet for Code Generation?' regarding repair versus fresh generation "
+                "and the effect of feedback quality."
+            ),
+            "grading_notes": (
+                "Must state that repair can perform worse than sampling a fresh correct program "
+                "and that stronger feedback improves repair, including the reported 1.58x "
+                "increase with human feedback."
+            ),
+        },
+        # Exact quotation is intentionally difficult for the baseline.
+        {
+            "question": (
+                "Quote verbatim the first three sentences of the abstract of VLMATERIAL: "
+                "Procedural Material Generation with Large Vision-Language Models."
+            ),
+            "grading_notes": (
+                "Must reproduce without paraphrasing that procedural materials are functional "
+                "node graphs used for photorealistic material design, that they allow intuitive "
+                "and precise editing, and that creating one from an input image requires "
+                "professional knowledge and significant effort."
+            ),
+        },
+        {
+            "question": (
+                "What benchmark improvement did Lee Ridings report for Martian rover repair "
+                "planning?"
+            ),
+            "grading_notes": (
+                "Must state that the provided research-paper corpus contains no supporting "
+                "evidence and must not invent a benchmark result."
+            ),
+        },
+    ]
+
+
+def validate_framework(llm: ChatOpenAI, retriever: HybridRetriever) -> None:
+    """Confirm that the judge rejects a deliberately incorrect answer."""
+    item = my_eval_set()[0]
+    hits = retriever.retrieve(item["question"], TOP_K)
+    good_answer = answer(llm, item["question"], hits)
+    manipulated_answer = (
+        "The paper used only the MNIST dataset and did not evaluate explainability."
+    )
+    good_verdict = judge(llm, good_answer, item["grading_notes"])
+    manipulated_verdict = judge(llm, manipulated_answer, item["grading_notes"])
+
+    print("\n--- Framework validation ---")
+    print(f"  generated answer   -> {good_verdict.upper()}")
+    print(f"  manipulated answer -> {manipulated_verdict.upper()}   (expected FAIL)")
+    log(
+        "FRAMEWORK VALIDATION",
+        f"good={good_verdict}\nmanipulated={manipulated_verdict}",
+    )
+
+
+def run_evaluation(retriever: HybridRetriever, llm: ChatOpenAI) -> None:
+    eval_set = my_eval_set()
+    passes = 0
+
+    print(f"Checkpoint 3.1 — baseline evaluation  |  scenario: {SCENARIO}\n")
+    for i, item in enumerate(eval_set, 1):
+        hits = retriever.retrieve(item["question"], TOP_K)
+        result = answer(llm, item["question"], hits) if hits else "(no pages retrieved)"
+        verdict = judge(llm, result, item["grading_notes"])
+        passes += verdict == "pass"
+
+        print("=" * 72)
+        print(f"Q{i}: {item['question']}")
+        for document, score in hits:
+            print(f"    - {source_label(document)} | hybrid score={score:.3f}")
+        print(f"  verdict: {verdict.upper()}")
+        print(f"  answer: {result}\n")
+
+        retrieved = "\n".join(
+            f"- {source_label(document)} | hybrid score={score:.3f}"
+            for document, score in hits
+        )
+        log(
+            f"Q{i}: {item['question']}",
+            f"retrieved:\n{retrieved}\nverdict={verdict}\nanswer={result}",
+        )
+
+    print("=" * 72)
+    print(f"Baseline pass rate: {passes}/{len(eval_set)}")
+    validate_framework(llm, retriever)
+
+
+def run_chat(retriever, llm) -> None:
+    """Search and answer each question independently; no evaluation judge."""
+    print("\nAsk about your papers. Type exit or quit to stop.")
+    print("Questions and retrieved text are sent to OpenRouter.")
+    print("Previous turns are not sent to the model.")
+    try:
+        while True:
+            question = input("\nYou: ").strip()
+            if question.lower() in {"exit", "quit"}:
+                break
+            if not question:
+                continue
+            hits = retriever.retrieve(question, TOP_K)
+            for document, score in hits:
+                print(f"  [{source_label(document)}] score={score:.3f}")
+            result = answer(llm, question, hits) if hits else "No supporting pages were retrieved."
+            print(f"\nAssistant: {result}")
+    except (EOFError, KeyboardInterrupt):
+        print("\nChat closed.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-index", action="store_true",
+                        help="Allow creating a missing index; sends PDF text to OpenRouter.")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Run this checkpoint's five questions and judge validation instead of chat.")
+    args = parser.parse_args()
+    documents, vector_db = load_research_data(args.build_index)
+    retriever = HybridRetriever(documents, vector_db)
+    llm = make_llm()
+    if args.evaluate:
+        run_evaluation(retriever, llm)
+    else:
+        run_chat(retriever, llm)
+
+
+if __name__ == "__main__":
+    main()
